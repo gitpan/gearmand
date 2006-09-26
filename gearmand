@@ -38,32 +38,44 @@ Brad Whitaker <whitaker@danga.com>
 
 =cut
 
+package Gearmand;
 use strict;
+use warnings;
+BEGIN {
+    $^P = 0x200;  # Provide informative names to anonymous subroutines
+}
 use Getopt::Long;
 use Carp;
-use Danga::Socket;
+use Danga::Socket 1.52;
 use IO::Socket::INET;
 use POSIX ();
 use Gearman::Util;
 use vars qw($DEBUG $VERSION);
+use Socket qw(IPPROTO_TCP TCP_NODELAY SOL_SOCKET);
+use Scalar::Util ();
+
 $DEBUG = 0;
-$VERSION = "1.01";
+$VERSION = "1.03";
 
 my (
     $daemonize,
     $nokeepalive,
+    $notify_pid,
    );
 my $conf_port = 7003;
 
 Getopt::Long::GetOptions(
-    'd|daemon'       => \$daemonize,
-    'p|port=i'       => \$conf_port,
-    'debug=i'        => \$DEBUG,
-   );
+                         'd|daemon'       => \$daemonize,
+                         'p|port=i'       => \$conf_port,
+                         'debug=i'        => \$DEBUG,
+                         'notifypid|n=i'  => \$notify_pid,  # for test suite only.
+                         );
 
 daemonize() if $daemonize;
 
-use Socket qw(IPPROTO_TCP TCP_NODELAY SOL_SOCKET);
+# true if we've closed listening socket, and we're waiting for a
+# convenient place to kill the process
+our $graceful_shutdown = 0;
 
 $SIG{'PIPE'} = "IGNORE";  # handled manually
 
@@ -82,7 +94,7 @@ my $server = IO::Socket::INET->new(LocalPort => $conf_port,
 IO::Handle::blocking($server, 0);
 
 my $accept_handler = sub {
-    my $csock = $server->accept();
+    my $csock = $server->accept;
     return unless $csock;
 
     printf("Listen child making a Client for %d.\n", fileno($csock))
@@ -96,6 +108,20 @@ my $accept_handler = sub {
 };
 
 Gearman::Server::Client->OtherFds(fileno($server) => $accept_handler);
+
+sub shutdown_graceful {
+    return if $graceful_shutdown;
+
+    my $ofds = Gearman::Server::Client->OtherFds;
+    delete $ofds->{fileno($server)};
+    $server->close;
+    $graceful_shutdown = 1;
+    shutdown_if_calm();
+}
+
+sub shutdown_if_calm {
+    exit 0 unless Gearman::Server::Job->JobsOutstanding;
+}
 
 sub daemonize {
     my($pid, $sess_id, $i);
@@ -158,11 +184,12 @@ package Gearman::Server::Client;
 use Danga::Socket;
 use base 'Danga::Socket';
 use fields (
-            'can_do',  # { $job_name => 1 }
+            'can_do',  # { $job_name => $timeout } $timeout can be undef indicating no timeout
             'can_do_list',
             'can_do_iter',
             'read_buf',
             'sleeping',   # 0/1:  they've said they're sleeping and we haven't woken them up
+            'timer', # Timer for job cancellation
             'doing',  # { $job_handle => Job }
             'client_id',  # opaque string, no whitespace.  workers give this so checker scripts
                           # can tell apart the same worker connected to multiple jobservers.
@@ -232,10 +259,14 @@ sub Grab {
         return $job unless $job->{require_listener};
 
         foreach my Gearman::Server::Client $c (@{$job->{listeners}}) {
-            return $job unless $c->{closed};
+            return $job if $c && ! $c->{closed};
         }
         $job->note_finished(0);
     }
+}
+
+sub JobsOutstanding {
+    return scalar keys %job_queue;
 }
 
 sub GetByHandle {
@@ -246,15 +277,22 @@ sub GetByHandle {
 sub add_listener {
     my Gearman::Server::Job $self = shift;
     my Gearman::Server::Client $li = shift;
+
     push @{$self->{listeners}}, $li;
+    Scalar::Util::weaken($self->{listeners}->[-1]);
 }
 
 sub relay_to_listeners {
     my Gearman::Server::Job $self = shift;
     foreach my Gearman::Server::Client $c (@{$self->{listeners}}) {
-        next if $c->{closed};
+        next if !$c || $c->{closed};
         $c->write($_[0]);
     }
+}
+
+sub clear_listeners {
+    my Gearman::Server::Job $self = shift;
+    $self->{listeners} = [];
 }
 
 sub note_finished {
@@ -265,6 +303,10 @@ sub note_finished {
         delete $jobOfUniq{$self->{func}}{$self->{uniq}};
     }
     delete $jobOfHandle{$self->{handle}};
+
+    if ($Gearmand::graceful_shutdown) {
+        Gearmand::shutdown_if_calm();
+    }
 }
 
 # accessors:
@@ -404,30 +446,37 @@ sub event_write {
     $self->watch_write(0) if $done;
 }
 
-# line-based commands
+# Line based command processor
+
 sub process_line {
     my Gearman::Server::Client $self = shift;
     my $line = shift;
 
-    if ($line =~ /^(\w+)\s*(.*)/) {
+    if ($line && $line =~ /^(\w+)\s*(.*)/) {
         my ($cmd, $args) = ($1, $2);
         $cmd = lc($cmd);
-
-        no strict 'refs';
-        my $cmd_handler = *{"TXTCMD_$cmd"}{CODE};
-        if ($cmd_handler) {
-            my $args = decode_url_args(\$args);
-            $cmd_handler->($self, $args);
-            next;
+        my $code = $self->can("TXTCMD_$cmd");
+        if ($code) {
+            $code->($self, $args);
+            return;
         }
     }
 
     return $self->err_line('unknown_command');
 }
 
+=head1 Line based commands
+
+These commands are used for administrative or statistic tasks to be done on the gearman server. They can be entered using a line based client (telnet, etc.) by connecting to the listening port (7003) and are also intended to be machine parsable.
+
+=head2 WORKERS
+
+Docs to be done later for this function, read the source for this one. Nyah nyah.
+
+=cut
+
 sub TXTCMD_workers {
     my Gearman::Server::Client $self = shift;
-    my $args = shift;
 
     foreach my $fd (sort { $a <=> $b } keys %client_map) {
         my Gearman::Server::Client $cl = $client_map{$fd};
@@ -435,6 +484,105 @@ sub TXTCMD_workers {
 
     }
     $self->write(".\n");
+}
+
+=head2 STATUS
+
+The output format of this function is tab separated columns as follows, followed by a line consisting of a fullstop and a newline (".\n") to indicate the end of output.
+
+=over
+
+=item Function name
+
+A string denoting the name of the function of the job
+
+=item Number in queue
+
+A positive integer indicating the total number of jobs for this function in the queue. This includes currently running ones as well (next column)
+
+=item Number of jobs running
+
+A positive integer showing how many jobs of this function are currently running
+
+=item Number of capable workers
+
+A positive integer denoting the maximum possible count of workers that could be doing this job. Though they may not all be working on it due to other tasks holding them busy.
+
+=back
+
+=cut
+
+sub TXTCMD_status {
+    my Gearman::Server::Client $self = shift;
+
+    my %can;
+
+    foreach my $client (values %client_map) {
+        foreach my $func (@{$client->{can_do_list}}) {
+            $can{$func}++;
+        }
+    }
+
+    my %queued_funcs;
+    my %running_funcs;
+
+    foreach my $job (values %jobOfHandle) {
+        my $func = $job->func;
+        $queued_funcs{$func}++;
+        if ($job->worker) {
+            $running_funcs{$func}++;
+        }
+    }
+
+    while (my ($func, $queued) = each %queued_funcs) {
+        my $running = $running_funcs{$func} || 0;
+        my $can = $can{$func} || 0;
+        $self->write( "$func\t$queued\t$running\t$can\n" );
+    }
+
+    $self->write( ".\n" );
+}
+
+sub TXTCMD_gladiator {
+    my Gearman::Server::Client $self = shift;
+    my $args = shift || "";
+    my $has_gladiator = eval "use Devel::Gladiator; use Devel::Peek; 1;";
+    if ($has_gladiator) {
+        my $all = Devel::Gladiator::walk_arena();
+        my %ct;
+        foreach my $it (@$all) {
+            $ct{ref $it}++;
+            if (ref $it eq "CODE") {
+                my $name = Devel::Peek::CvGV($it);
+                $ct{$name}++ if $name =~ /ANON/;
+            }
+        }
+        $all = undef;  # required to free memory
+        foreach my $n (sort { $ct{$a} <=> $ct{$b} } keys %ct) {
+            next unless $ct{$n} > 1 || $args eq "all";
+            $self->write(sprintf("%7d $n\n", $ct{$n}));
+        }
+    }
+    $self->write(".\n");
+}
+
+sub TXTCMD_shutdown {
+    my Gearman::Server::Client $self = shift;
+    my $args = shift;
+    if ($args eq "graceful") {
+        $self->write("OK\n");
+        Gearmand::shutdown_graceful();
+    } elsif (! $args) {
+        $self->write("OK\n");
+        exit 0;
+    } else {
+        $self->err_line('unknown_args');
+    }
+}
+
+sub TXTCMD_version {
+    my Gearman::Server::Client $self = shift;
+    $self->write("$Gearmand::VERSION\n");
 }
 
 sub CMD_echo_req {
@@ -471,6 +619,10 @@ sub CMD_work_complete {
     my $msg = Gearman::Util::pack_res_command("work_complete", join("\0", $handle, $$ar));
     $job->relay_to_listeners($msg);
     $job->note_finished(1);
+    if (my $timer = $self->{timer}) {
+        $timer->cancel;
+        $self->{timer} = undef;
+    }
 
     return 1;
 }
@@ -485,6 +637,11 @@ sub CMD_work_fail {
     my $msg = Gearman::Util::pack_res_command("work_fail", $handle);
     $job->relay_to_listeners($msg);
     $job->note_finished(1);
+    if (my $timer = $self->{timer}) {
+        $timer->cancel;
+        $self->{timer} = undef;
+    }
+
     return 1;
 }
 
@@ -531,6 +688,20 @@ sub CMD_grab_job {
         if ($job) {
             $job->worker($self);
             $self->{doing}{$job->handle} = $job;
+
+            my $timeout = $self->{can_do}->{$job_to_grab};
+            if (defined $timeout) {
+                my $timer = Danga::Socket->AddTimer($timeout, sub {
+                    return $self->error_packet("not_worker") unless $job->worker == $self;
+
+                    my $msg = Gearman::Util::pack_res_command("work_fail", $job->handle);
+                    $job->relay_to_listeners($msg);
+                    $job->note_finished(1);
+                    $job->clear_listeners;
+                    $self->{timer} = undef;
+                });
+                $self->{timer} = $timer;
+            }
             return $self->res_packet("job_assign",
                                      join("\0",
                                           $job->handle,
@@ -547,7 +718,22 @@ sub CMD_can_do {
     my Gearman::Server::Client $self = shift;
     my $ar = shift;
 
-    $self->{can_do}->{$$ar} = 1;
+    $self->{can_do}->{$$ar} = undef;
+    $self->_setup_can_do_list;
+}
+
+sub CMD_can_do_timeout {
+    my Gearman::Server::Client $self = shift;
+    my $ar = shift;
+
+    my ($task, $timeout) = $$ar =~ m/([^\0]+)(?:\0(.+))?/;
+
+    if (defined $timeout) {
+        $self->{can_do}->{$task} = $timeout;
+    } else {
+        $self->{can_do}->{$task} = undef;
+    }
+
     $self->_setup_can_do_list;
 }
 
@@ -586,6 +772,9 @@ sub CMD_get_status {
             ($num, $den) = @$stat;
         }
     }
+
+    $num = '' unless defined $num;
+    $den = '' unless defined $den;
 
     $self->res_packet("status_res", join("\0",
                                          $$ar,
@@ -673,50 +862,22 @@ sub err_line {
     my $err_code = shift;
     my $err_text = {
         'unknown_command' => "Unknown server command",
+        'unknown_args' => "Unknown arguments to server command",
     }->{$err_code};
 
     $self->write("ERR $err_code " . eurl($err_text) . "\r\n");
     return 0;
 }
 
-sub eurl
-{
+sub eurl {
     my $a = $_[0];
     $a =~ s/([^a-zA-Z0-9_\,\-.\/\\\: ])/uc sprintf("%%%02x",ord($1))/eg;
     $a =~ tr/ /+/;
     return $a;
 }
 
-sub durl
-{
-    my ($a) = @_;
-    $a =~ tr/+/ /;
-    $a =~ s/%([a-fA-F0-9][a-fA-F0-9])/pack("C", hex($1))/eg;
-    return $a;
-}
-
-sub decode_url_args
-{
-    my $a = shift;
-    my $buffer = ref $a ? $a : \$a;
-    my $ret = {};
-
-    my $pair;
-    my @pairs = split(/&/, $$buffer);
-    my ($name, $value);
-    foreach $pair (@pairs)
-    {
-        ($name, $value) = split(/=/, $pair);
-        $value =~ tr/+/ /;
-        $value =~ s/%([a-fA-F0-9][a-fA-F0-9])/pack("C", hex($1))/eg;
-        $name =~ tr/+/ /;
-        $name =~ s/%([a-fA-F0-9][a-fA-F0-9])/pack("C", hex($1))/eg;
-        $ret->{$name} .= $ret->{$name} ? "\0$value" : $value;
-    }
-    return $ret;
-}
-
 package main;
+kill 'USR1', $notify_pid if $notify_pid;
 Danga::Socket->EventLoop();
 
 # Local Variables:
