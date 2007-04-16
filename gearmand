@@ -20,11 +20,34 @@ gearmand servers.
 The servers connects them, multiplexing duplicate requests as
 requested, etc.
 
+=head1 OPTIONS
+
+=over
+
+=item --daemonize 
+
+Make the daemon run in the background (good for init.d scripts, bad
+for running under daemontools/supervise).
+
+=item --port=7003 / -p 7003
+
+Set the port number, defaults to 7003.
+
+=item --pidfile=/some/dir/gearmand.pid
+
+Write a pidfile when starting up
+
+=item --debug=1
+
+Enable debugging (currently the only debug output is when a client or worker connects).
+
+=back
+
 =head1 COPYRIGHT
 
-Copyright 2005-2006, Danga Interactive
+Copyright 2005-2007, Danga Interactive
 
-You're granted a license to use it under the same terms as Perl itself.
+You are granted a license to use it under the same terms as Perl itself.
 
 =head1 WARRANTY
 
@@ -55,12 +78,13 @@ use Socket qw(IPPROTO_TCP TCP_NODELAY SOL_SOCKET);
 use Scalar::Util ();
 
 $DEBUG = 0;
-$VERSION = "1.03";
+$VERSION = "1.05";
 
 my (
     $daemonize,
     $nokeepalive,
     $notify_pid,
+    $opt_pidfile,
    );
 my $conf_port = 7003;
 
@@ -68,6 +92,7 @@ Getopt::Long::GetOptions(
                          'd|daemon'       => \$daemonize,
                          'p|port=i'       => \$conf_port,
                          'debug=i'        => \$DEBUG,
+			 'pidfile=s'      => \$opt_pidfile,
                          'notifypid|n=i'  => \$notify_pid,  # for test suite only.
                          );
 
@@ -87,6 +112,12 @@ my $server = IO::Socket::INET->new(LocalPort => $conf_port,
                                    Reuse     => 1,
                                    Listen    => 10 )
     or die "Error creating socket: $@\n";
+
+if ($opt_pidfile) {
+  open my $fh, '>', $opt_pidfile or die "Could not open $opt_pidfile: $!";
+  print $fh "$$\n";
+  close $fh;
+}
 
 # Not sure if I'm crazy or not, but I can't see in strace where/how
 # Perl 5.6 sets blocking to 0 without this.  In Perl 5.8, IO::Socket::INET
@@ -176,6 +207,7 @@ our $handle_base = "H:" . hostname() . ":";
 our %job_queue;  # job_name -> [Job, Job*]   (key only exists if non-empty)
 our %jobOfHandle;  # handle -> Job
 our %jobOfUniq;   # func -> uniq -> Job
+our %max_queue;   # Explicit maximum jobqueue sizes, by jobtype.
 
 #####################################################################
 ### Client definition
@@ -232,6 +264,17 @@ sub new {
     $self->{'handle'} = $handle_base . $handle_ct;
 
     my $jq = ($job_queue{$func} ||= []);
+
+    if (defined (my $max_queue_size = $max_queue{$func})) {
+        $max_queue_size--; # Subtract one, because we're about to add one more below.
+        while (@$jq > $max_queue_size) {
+            my $delete_job = pop @$jq;
+            my $msg = Gearman::Util::pack_res_command("work_fail", $delete_job->handle);
+            $delete_job->relay_to_listeners($msg);
+            $delete_job->note_finished;
+        }
+    }
+
     if ($highpri) {
         unshift @$jq, $self;
     } else {
@@ -566,6 +609,33 @@ sub TXTCMD_gladiator {
     $self->write(".\n");
 }
 
+=head2 MAXQUEUE function [max_queue_size]
+
+For a given function of job, the maximum queue size is adjusted to be max_queue_size jobs long. A negative value indicates unlimited queue size.
+
+If the max_queue_size value is not supplied then it is unset (and the default maximum queue size will apply to this function).
+
+This function will return OK upon success, and will return ERR incomplete_args upon an invalid number of arguments.
+
+=cut
+
+sub TXTCMD_maxqueue {
+    my Gearman::Server::Client $self = shift;
+    my $args = shift;
+    my ($func, $max) = split /\s+/, $args;
+
+    unless (length $func) {
+        return $self->err_line('incomplete_args');
+    }
+
+    if (length $max) {
+        $max_queue{$func} = ($max < 0) ? undef : $max + 0;
+    } else {
+        delete $max_queue{$func};
+    }
+    $self->write("OK\n");
+}
+
 sub TXTCMD_shutdown {
     my Gearman::Server::Client $self = shift;
     my $args = shift;
@@ -863,6 +933,7 @@ sub err_line {
     my $err_text = {
         'unknown_command' => "Unknown server command",
         'unknown_args' => "Unknown arguments to server command",
+        'incomplete_args' => "An incomplete set of arguments was sent to this command",
     }->{$err_code};
 
     $self->write("ERR $err_code " . eurl($err_text) . "\r\n");
